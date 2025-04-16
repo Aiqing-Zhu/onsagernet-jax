@@ -297,6 +297,285 @@ class SDETrainer(ABC):
         return model, losses, opt_state
 
 
+class SDETrainer_V2(ABC):
+    """Base class for training SDE models version 2, can compute the test loss."""
+
+    def __init__(
+        self, opt_options: dict, rop_options: dict, loss_options: Optional[dict] = None
+    ) -> None:
+        """SDE training routine.
+
+        Args:
+            opt_options (dict): dictionary of options for the optimiser
+            rop_options (dict): dictionary of options for the reduce-on-plateau callback
+            loss_options (Optional[dict], optional): dictionary of options for loss computation. Defaults to None.
+        """
+        self._opt_options = opt_options
+        self._rop_options = rop_options
+        self._loss_options = loss_options
+
+    @eqx.filter_jit
+    @abstractmethod
+    def loss_func(
+        self,
+        diff_model: DynamicModel,
+        static_model: DynamicModel,
+        t: ArrayLike,
+        x: ArrayLike,
+        args: ArrayLike,
+    ) -> float:
+        """Loss function.
+
+        This must be implemented by sub-classes.
+
+        Args:
+            diff_model (DynamicModel): the trainable part of the model
+            static_model (DynamicModel): the static part of the model
+            t (ArrayLike): time
+            x (ArrayLike): state
+            args (ArrayLike): additional arguments or parameters. The first dimension is temperature.
+
+        Returns:
+            float: loss value
+        """
+        pass
+
+    def _make_optimiser(
+        self, opt_options: dict, rop_options: dict
+    ) -> GradientTransformation:
+        """Make an optimiser.
+
+        Args:
+            opt_options (dict): optimiser options
+            rop_options (dict): reduce-on-plateau options
+
+        Returns:
+            GradientTransformation: an optimiser object from `optax`
+        """
+        return chain(adam(**opt_options), reduce_on_plateau(**rop_options))
+
+    @eqx.filter_jit
+    def _make_step(
+        self,
+        model: DynamicModel,
+        data: Dataset,
+        opt: GradientTransformation,
+        opt_state: OptState,
+        filter_spec: Any,
+    ) -> tuple[DynamicModel, OptState, float]:
+        """Make a training step.
+
+        Args:
+            model (DynamicModel): the model to be trained
+            data (Dataset): the dataset object
+            opt (GradientTransformation): optimiser object
+            opt_state (OptState): optimiser state
+            filter_spec (Any): the filtering logic to determine which parts of the model to train
+
+        Returns:
+            tuple[DynamicModel, OptState, float]: trained model, optimiser state, loss value
+        """
+        diff_model, static_model = eqx.partition(model, filter_spec)
+
+        loss_value, grads = eqx.filter_value_and_grad(self.loss_func)(
+            diff_model, static_model, *data
+        )
+        updates, opt_state = opt.update(grads, opt_state, model, value=loss_value)
+        model = eqx.apply_updates(model, updates)
+        return model, loss_value, opt_state
+
+    def _train_epoch(
+        self,
+        model: DynamicModel,
+        dataset: Dataset,
+        batch_size: int,
+        opt: GradientTransformation,
+        opt_state: OptState,
+        filter_spec: Any,
+    ) -> tuple[DynamicModel, float, OptState]:
+        """Train the model for an epoch.
+
+        Args:
+            model (DynamicModel): the model to be trained
+            dataset (Dataset): the dataset object
+            batch_size (int): the batch size
+            opt (GradientTransformation): the optimiser object
+            opt_state (OptState): the optimiser state
+            filter_spec (Any): the filtering logic to determine which parts of the model to train
+
+        Returns:
+            tuple[DynamicModel, float, OptState]: trained model, loss value, optimiser state
+        """
+
+        step_losses = []
+
+        # for batch in tqdm(
+        #     dataset.iter(batch_size),
+        #     total=dataset.num_rows // batch_size,
+        # ):
+        for batch in dataset.iter(batch_size):
+            data_batch = (batch["t"], batch["x"], batch["args"])
+            model, train_loss, opt_state = self._make_step(
+                model, data_batch, opt, opt_state, filter_spec
+            )
+            step_losses.append(train_loss)
+        epoch_loss = jnp.mean(jnp.array(step_losses))
+        
+        return model, epoch_loss, opt_state
+
+    def train(
+        self,
+        model: DynamicModel,
+        dataset: Dataset,
+        num_epochs: int,
+        batch_size: int,
+        test_dataset: Optional[Dataset] = None,
+        logger: Optional[Logger] = None,
+        opt_state: Optional[OptState] = None,
+        filter_spec: Optional[Any] = None,
+        checkpoint_dir: Optional[str] = None,
+        checkpoint_every: Optional[int] = None,
+        print_every: Optional[int] = 1,
+    ) -> tuple[DynamicModel, list[float], OptState]:
+        """The main training routine.
+
+        Args:
+            model (DynamicModel): the model to be trained
+            dataset (Dataset): the dataset
+            num_epochs (int): number of epochs to train
+            batch_size (int): the batch size
+            logger (Optional[Logger], optional): the logging object. Defaults to None.
+            opt_state (Optional[OptState], optional): the starting optimiser state. Defaults to None.
+            filter_spec (Optional[Any], optional): the filtering logic. Defaults to None.
+            checkpoint_dir (Optional[str], optional): the directory to save checkpoints. Defaults to None.
+            checkpoint_every (Optional[int], optional): checkpoints are saved every `checkpoint_every` number of epochs. Defaults to None.
+
+        Returns:
+            tuple[DynamicModel, list[float], OptState]: trained model, list of losses, optimiser state
+        """
+        opt = self._make_optimiser(self._opt_options, self._rop_options)
+        if opt_state is None:
+            opt_state = opt.init(eqx.filter(model, eqx.is_array))
+
+        if filter_spec is None:
+            filter_spec = tree_map(lambda _: True, model)
+
+        losses = []
+        test_losses=[]
+        for epoch in range(num_epochs):
+            model, step_loss, opt_state = self._train_epoch(
+                model=model,
+                dataset=dataset,
+                batch_size=batch_size,
+                opt=opt,
+                opt_state=opt_state,
+                filter_spec=filter_spec,
+            )
+            losses.append(step_loss)
+            if logger and epoch % print_every == 0:
+                lr_scale = tree_get(opt_state, "scale")
+                if test_dataset is None:
+                    logger.info(
+                        f"epoch={epoch:05d}, loss={step_loss:.6f}, lr_scale={lr_scale:.4f}"
+                    )
+                else:
+                    test_loss = self._evaluate(
+                        model=model,
+                        dataset=test_dataset,
+                        batch_size=batch_size,
+                        filter_spec=filter_spec,
+                        )
+                    test_losses.append(test_loss)
+                    logger.info(
+                        f"epoch={epoch:05d}, train_loss={step_loss:.6f}, test_loss={test_loss:.6f}, lr_scale={lr_scale:.4f}"
+                    )
+
+            if checkpoint_dir is not None and epoch % checkpoint_every == 0:
+                model_path = os.path.join(
+                    checkpoint_dir, f"model_epoch_{epoch:05d}.eqx"
+                )
+                eqx.tree_serialise_leaves(model_path, model)
+        if test_dataset is not None:
+            losses = [losses, test_losses]
+        return model, losses, opt_state
+
+    @eqx.filter_jit
+    def _compute_loss(
+        self,
+        model: DynamicModel,
+        data: Dataset,
+        filter_spec: Any,
+    ) -> float:
+        """Compute the loss for the given data.
+
+        Args:
+            model (DynamicModel): the model to be evaluated
+            data (Dataset): the dataset object
+            filter_spec (Any): the filtering logic to determine which parts of the model to evaluate
+
+        Returns:
+            float: loss value
+        """
+        diff_model, static_model = eqx.partition(model, filter_spec)
+        loss_value = self.loss_func(diff_model, static_model, *data)
+        return loss_value
+    
+    def _evaluate(
+        self,
+        model: DynamicModel,
+        dataset: Dataset,
+        batch_size: int,
+        filter_spec: Any,
+    ) -> float:
+        """Evaluate the model on the given dataset.
+
+        Args:
+            model (DynamicModel): the model to be evaluated
+            dataset (Dataset): the dataset object
+            batch_size (int): the batch size
+            filter_spec (Any): the filtering logic to determine which parts of the model to evaluate
+
+        Returns:
+            float: loss value
+        """
+
+        step_losses = []
+
+        for batch in dataset.iter(batch_size):
+            data_batch = (batch["t"], batch["x"], batch["args"])
+            loss_value = self._compute_loss(model, data_batch, filter_spec)
+            step_losses.append(loss_value)
+        epoch_loss = jnp.mean(jnp.array(step_losses))
+        return epoch_loss
+
+class MLETrainer_V2(SDETrainer_V2):
+    """MLETrainer for SDE models using SDETrainer_V2, which can compute test loss."""
+    @eqx.filter_jit
+    def loss_func(
+        self,
+        diff_model: DynamicModel,
+        static_model: DynamicModel,
+        t: ArrayLike,
+        x: ArrayLike,
+        args: ArrayLike,
+    ) -> float:
+        """The MLE loss function.
+
+        See [`MLELoss`](./_losses.html#MLELoss) for more details.
+
+        Args:
+            diff_model (DynamicModel): the trainable part of the model
+            static_model (DynamicModel): the static part of the model
+            t (ArrayLike): time
+            x (ArrayLike): state
+            args (ArrayLike): additional arguments or parameters.
+
+        Returns:
+            float: the computed loss
+        """
+        model = eqx.combine(diff_model, static_model)
+        return MLELoss()(model, t, x, args)
+
 class MLETrainer(SDETrainer):
 
     @eqx.filter_jit
