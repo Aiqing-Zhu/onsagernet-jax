@@ -446,7 +446,7 @@ class DiffusionDiagonalMLP(MLP):
         super().__init__(key, dim + param_dim, units, activation)
         self.alpha = alpha
 
-    def __call__(self, x: ArrayLike, args: ArrayLike) -> Array:
+    def __call__(self, x: ArrayLike, args: ArrayLike = None) -> Array:
         if self.param_dim > 0:
             x = jnp.concatenate([x, args[1:]], axis=0)
         sigma_diag = super().__call__(x)

@@ -643,7 +643,7 @@ class OnsagerNetHD2(SDE):
         grad_H = jax.jacfwd(self.Hamiltonian, argnums=0)(x)
         gamma = jnp.einsum('dab,db->a', self.J, grad_H) - jnp.einsum('d,dab,b->a', H, self.J, dvdx)
 
-        return - dissipation(x) @ dvdx #+ gamma + temperature * self._matrix_div(dissipation, x) 
+        return - dissipation(x) @ dvdx + gamma + temperature * self._matrix_div(dissipation, x) 
 
 
     def diffusion(self, t: ArrayLike, x: ArrayLike, args: ArrayLike) -> Array:
